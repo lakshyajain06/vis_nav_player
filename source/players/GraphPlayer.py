@@ -1,25 +1,18 @@
-"""
-Baseline Level-1: VLAD-based visual navigation.
-
-Pipeline: RootSIFT → KMeans codebook → VLAD → cosine similarity graph → Dijkstra
-"""
-
 from vis_nav_game import Player, Action, Phase
 import pygame
 import cv2
 import numpy as np
 import os
 import json
-import pickle
 import networkx as nx
-from sklearn.cluster import KMeans
-from tqdm import tqdm
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+
+from extractors.VladExtractor import VLADExtractor
+from extractors.DinoExtractor import DINOv2Extractor
+
 CACHE_DIR = "cache"
-DATA_DIR = "data/exploration_data"
+IMAGE_DIR = "data/images/"
+DATA_INFO_PATH = "data/data_info.json"
 
 # Graph construction
 TEMPORAL_WEIGHT = 1.0       # edge weight for consecutive frames
@@ -27,122 +20,9 @@ VISUAL_WEIGHT_BASE = 2.0    # base weight for visual shortcut edges
 VISUAL_WEIGHT_SCALE = 3.0   # weight += scale * vlad_distance
 MIN_SHORTCUT_GAP = 50       # minimum trajectory index gap for shortcuts
 
-os.makedirs(CACHE_DIR, exist_ok=True)
+class GraphPlayer(Player):
 
-
-# ---------------------------------------------------------------------------
-# VLAD Feature Extraction
-# ---------------------------------------------------------------------------
-class VLADExtractor:
-    """RootSIFT + VLAD with intra-normalization and power normalization."""
-
-    def __init__(self, n_clusters: int = 128):
-        self.n_clusters = n_clusters
-        self.sift = cv2.SIFT_create()
-        self.codebook = None
-        self._sift_cache: dict[str, np.ndarray] = {}
-
-    @property
-    def dim(self) -> int:
-        return self.n_clusters * 128
-
-    # --- Internal helpers ---
-
-    @staticmethod
-    def _root_sift(des: np.ndarray) -> np.ndarray:
-        """L1-normalize then sqrt (Hellinger kernel approximation)."""
-        des = des / np.sum(des, axis=1, keepdims=True)
-        return np.sqrt(des)
-
-    def _des_to_vlad(self, des: np.ndarray) -> np.ndarray:
-        """Aggregate local descriptors into a single VLAD vector."""
-        labels = self.codebook.predict(des)
-        centers = self.codebook.cluster_centers_
-        k = self.codebook.n_clusters
-        vlad = np.zeros((k, des.shape[1]))
-        for i in range(k):
-            mask = labels == i
-            if np.any(mask):
-                vlad[i] = np.sum(des[mask] - centers[i], axis=0)
-                norm = np.linalg.norm(vlad[i])
-                if norm > 0:
-                    vlad[i] /= norm                     # intra-normalization
-        vlad = vlad.ravel()
-        vlad = np.sign(vlad) * np.sqrt(np.abs(vlad))   # power normalization
-        norm = np.linalg.norm(vlad)
-        if norm > 0:
-            vlad /= norm                                # L2 normalization
-        return vlad
-
-    # --- Public API ---
-
-    def load_sift_cache(self, file_list: list[str], subsample_rate: int):
-        """Load or compute RootSIFT descriptors for all images."""
-        cache_file = os.path.join(CACHE_DIR, f"sift_ss{subsample_rate}.pkl")
-        if os.path.exists(cache_file):
-            print(f"Loading cached SIFT from {cache_file}")
-            with open(cache_file, "rb") as f:
-                self._sift_cache = pickle.load(f)
-            if all(fname in self._sift_cache for fname in file_list):
-                return
-            print("  Cache incomplete, re-extracting...")
-
-        print(f"Extracting SIFT for {len(file_list)} images...")
-        self._sift_cache = {}
-        for fname in tqdm(file_list, desc="SIFT"):
-            img = cv2.imread(fname)
-            _, des = self.sift.detectAndCompute(img, None)
-            if des is not None:
-                self._sift_cache[fname] = self._root_sift(des)
-        with open(cache_file, "wb") as f:
-            pickle.dump(self._sift_cache, f)
-        print(f"  Saved {len(self._sift_cache)} descriptors -> {cache_file}")
-
-    def build_vocabulary(self, file_list: list[str]):
-        """Fit KMeans codebook on cached SIFT descriptors."""
-        cache_file = os.path.join(CACHE_DIR, f"codebook_k{self.n_clusters}.pkl")
-        if os.path.exists(cache_file):
-            print(f"Loading cached codebook from {cache_file}")
-            with open(cache_file, "rb") as f:
-                self.codebook = pickle.load(f)
-            return
-
-        all_des = np.vstack([self._sift_cache[f] for f in file_list
-                             if f in self._sift_cache])
-        print(f"Fitting KMeans (k={self.n_clusters}) on {len(all_des)} descriptors...")
-        self.codebook = KMeans(
-            n_clusters=self.n_clusters, init='k-means++',
-            n_init=3, max_iter=300, tol=1e-4, verbose=1, random_state=42,
-        ).fit(all_des)
-        print(f"  {self.codebook.n_iter_} iters, inertia={self.codebook.inertia_:.0f}")
-        with open(cache_file, "wb") as f:
-            pickle.dump(self.codebook, f)
-
-    def extract(self, img: np.ndarray) -> np.ndarray:
-        """Compute VLAD for a single BGR image."""
-        _, des = self.sift.detectAndCompute(img, None)
-        if des is None or len(des) == 0:
-            return np.zeros(self.dim)
-        return self._des_to_vlad(self._root_sift(des))
-
-    def extract_batch(self, file_list: list[str]) -> np.ndarray:
-        """Compute VLAD for all images using cached SIFT. Returns (N, dim)."""
-        vectors = []
-        for fname in tqdm(file_list, desc="VLAD"):
-            if fname in self._sift_cache and len(self._sift_cache[fname]) > 0:
-                vectors.append(self._des_to_vlad(self._sift_cache[fname]))
-            else:
-                vectors.append(np.zeros(self.dim))
-        return np.array(vectors)
-
-
-# ---------------------------------------------------------------------------
-# Player
-# ---------------------------------------------------------------------------
-class KeyboardPlayerPyGame(Player):
-
-    def __init__(self, n_clusters: int = 128, subsample_rate: int = 5,
-                 top_k_shortcuts: int = 30):
+    def __init__(self, extractor, subsample_rate: int = 5, top_k_shortcuts: int = 30, **kwargs):
         self.fpv = None
         self.last_act = Action.IDLE
         self.screen = None
@@ -152,81 +32,41 @@ class KeyboardPlayerPyGame(Player):
         self.subsample_rate = subsample_rate
         self.top_k_shortcuts = top_k_shortcuts
 
-        # Load trajectory data — supports both formats:
-        #   New: data/traj_0/, data/traj_1/, ... each with data_info.json + images
-        #   Legacy: data/images/ + data/data_info.json
-        self.motion_frames = []   # list of {step, image, action, traj_id, image_path}
-        self.file_list = []       # image paths relative to cwd
-        self.traj_boundaries = [] # (start_idx, end_idx) per trajectory in motion_frames
-
-        traj_dirs = sorted([
-            d for d in os.listdir(DATA_DIR)
-            if d.startswith('traj_') and os.path.isdir(os.path.join(DATA_DIR, d))
-        ])
-
-        if traj_dirs:
-            # New multi-trajectory format
-            all_motion = []
-            for traj_dir_name in traj_dirs:
-                traj_path = os.path.join(DATA_DIR, traj_dir_name)
-                info_path = os.path.join(traj_path, 'data_info.json')
-                if not os.path.exists(info_path):
-                    continue
-                with open(info_path) as f:
-                    raw = json.load(f)
-                traj_id = traj_dir_name
-                pure = {'FORWARD', 'LEFT', 'RIGHT', 'BACKWARD'}
-                traj_motion = [
-                    {'step': d['step'], 'image': d['image'], 'action': d['action'][0],
-                     'traj_id': traj_id, 'image_path': os.path.join(traj_path, d['image'])}
-                    for d in raw
-                    if len(d['action']) == 1 and d['action'][0] in pure
-                ]
-                start_idx = len(all_motion)
-                all_motion.extend(traj_motion)
-                end_idx = len(all_motion)
-                self.traj_boundaries.append((start_idx, end_idx))
-                print(f"  {traj_dir_name}: {len(traj_motion)} motion frames")
-
+        # Load trajectory data
+        self.motion_frames = []
+        self.file_list = []
+        if os.path.exists(DATA_INFO_PATH):
+            with open(DATA_INFO_PATH) as f:
+                raw = json.load(f)
+            pure = {'FORWARD', 'LEFT', 'RIGHT', 'BACKWARD'}
+            all_motion = [
+                {'step': d['step'], 'image': d['image'], 'action': d['action'][0]}
+                for d in raw
+                if len(d['action']) == 1 and d['action'][0] in pure
+            ]
             self.motion_frames = all_motion[::subsample_rate]
-            # Recompute boundaries after subsampling
-            self.traj_boundaries = []
-            prev_traj = None
-            for idx, m in enumerate(self.motion_frames):
-                if m['traj_id'] != prev_traj:
-                    if prev_traj is not None:
-                        self.traj_boundaries[-1] = (self.traj_boundaries[-1][0], idx)
-                    self.traj_boundaries.append((idx, len(self.motion_frames)))
-                    prev_traj = m['traj_id']
-            if self.traj_boundaries:
-                self.traj_boundaries[-1] = (self.traj_boundaries[-1][0], len(self.motion_frames))
-
-            self.file_list = [m['image_path'] for m in self.motion_frames]
+            self.file_list = [m['image'] for m in self.motion_frames]
             print(f"Frames: {len(all_motion)} total, "
-                  f"{len(self.motion_frames)} after {subsample_rate}x subsample, "
-                  f"{len(self.traj_boundaries)} trajectories")
-        else:
-            # Legacy single-directory format
-            legacy_info = os.path.join(DATA_DIR, 'data_info.json')
-            legacy_img_dir = os.path.join(DATA_DIR, 'images')
-            if os.path.exists(legacy_info):
-                with open(legacy_info) as f:
-                    raw = json.load(f)
-                pure = {'FORWARD', 'LEFT', 'RIGHT', 'BACKWARD'}
-                all_motion = [
-                    {'step': d['step'], 'image': d['image'], 'action': d['action'][0],
-                     'traj_id': 'traj_0',
-                     'image_path': os.path.join(legacy_img_dir, d['image'])}
-                    for d in raw
-                    if len(d['action']) == 1 and d['action'][0] in pure
-                ]
-                self.motion_frames = all_motion[::subsample_rate]
-                self.file_list = [m['image_path'] for m in self.motion_frames]
-                self.traj_boundaries = [(0, len(self.motion_frames))]
-                print(f"Frames (legacy): {len(all_motion)} total, "
-                      f"{len(self.motion_frames)} after {subsample_rate}x subsample")
+                  f"{len(self.motion_frames)} after {subsample_rate}x subsample")
 
-        self.extractor = VLADExtractor(n_clusters=n_clusters)
+        if extractor == "VLAD":
+            self.extractor = VLADExtractor(
+                file_list=self.file_list, 
+                img_dir=IMAGE_DIR, 
+                cache_dir=CACHE_DIR, 
+                subsample_rate=self.subsample_rate, 
+                **kwargs
+            )
+        elif extractor == "DINO":
+            self.extractor = DINOv2Extractor(
+                file_list=self.file_list, 
+                img_dir=IMAGE_DIR, 
+                cache_dir=CACHE_DIR, 
+                subsample_rate=self.subsample_rate
+            )
+        else:
+            raise TypeError("Not a valid extractor type")
+
         self.database = None
         self.G = None
         self.goal_node = None
@@ -299,9 +139,7 @@ class KeyboardPlayerPyGame(Player):
         if self.database is not None:
             print("Database already computed, skipping.")
             return
-        self.extractor.load_sift_cache(self.file_list, self.subsample_rate)
-        self.extractor.build_vocabulary(self.file_list)
-        self.database = self.extractor.extract_batch(self.file_list)
+        self.database = self.extractor.extract_batch()
         print(f"Database: {self.database.shape}")
 
     # --- Navigation graph ---
@@ -315,10 +153,9 @@ class KeyboardPlayerPyGame(Player):
         self.G = nx.Graph()
         self.G.add_nodes_from(range(n))
 
-        # Temporal edges (consecutive frames within each trajectory)
-        for start, end in self.traj_boundaries:
-            for i in range(start, end - 1):
-                self.G.add_edge(i, i + 1, weight=TEMPORAL_WEIGHT, edge_type="temporal")
+        # Temporal edges (consecutive frames)
+        for i in range(n - 1):
+            self.G.add_edge(i, i + 1, weight=TEMPORAL_WEIGHT, edge_type="temporal")
 
         # Visual shortcut edges: global top-K most similar pairs
         print("Computing similarity matrix...")
@@ -374,7 +211,7 @@ class KeyboardPlayerPyGame(Player):
     def _load_img(self, idx: int) -> np.ndarray | None:
         """Load image by database index."""
         if 0 <= idx < len(self.file_list):
-            return cv2.imread(self.file_list[idx])
+            return cv2.imread(os.path.join(IMAGE_DIR, self.file_list[idx]))
         return None
 
     def _get_current_node(self) -> int:
@@ -429,7 +266,7 @@ class KeyboardPlayerPyGame(Player):
         AA = cv2.LINE_AA
         TW, TH = 260, 195          # main thumbnails
         PW, PH = TW * 3 // 5, TH * 3 // 5   # path preview thumbnails
-        N_PREVIEW = 5
+        N_PREVIEW = 10
 
         # Localize & plan
         cur = self._get_current_node()
@@ -490,57 +327,58 @@ class KeyboardPlayerPyGame(Player):
         row1 = cv2.hconcat([fpv_t, match_t, tgt_t])
 
         # --- Row 2: path preview ---
+        # --- Row 2 & 3: Path Preview (Split into two rows) ---
         preview = path[1:1 + N_PREVIEW]
-        cells = []
+        all_cells = []
         for p in range(N_PREVIEW):
             if p < len(preview):
                 img = self._load_img(preview[p])
                 if img is None:
                     img = np.zeros((PH, PW, 3), dtype=np.uint8)
                 img = cv2.resize(img, (PW, PH))
+                
+                # --- RE-ADDED TEXT LOGIC ---
                 etype, act, is_fwd = edge_info[p]
                 if etype == "seq":
                     lbl = f"{'>' if is_fwd else '<'} {act}"
-                    clr = (200, 200, 0)
+                    clr = (200, 200, 0) # Cyan-ish
                 else:
                     lbl = "~ VISUAL"
-                    clr = (200, 100, 255)
+                    clr = (200, 100, 255) # Pink-ish
+                
                 cv2.rectangle(img, (0, 0), (PW-1, PH-1), clr, 1)
                 cv2.putText(img, f"+{p+1} node {preview[p]}", (4, 16),
                             FONT, 0.38, (255, 255, 255), 1, AA)
                 cv2.putText(img, lbl, (4, 34), FONT, 0.38, clr, 1, AA)
+                # ---------------------------
             else:
+                # Blank placeholder for empty slots
                 img = np.zeros((PH, PW, 3), dtype=np.uint8)
-            cells.append(img)
-        row2 = cv2.hconcat(cells)
+            all_cells.append(img)
 
-        # Pad row2 to match panel width
-        if row2.shape[1] < panel_w:
-            pad = np.zeros((PH, panel_w - row2.shape[1], 3), dtype=np.uint8)
-            row2 = cv2.hconcat([row2, pad])
+        # Split cells: 0-4 on Row 2, 5-9 on Row 3
+        row2 = cv2.hconcat(all_cells[:5])
+        row3 = cv2.hconcat(all_cells[5:10])
 
-        panel = cv2.vconcat([bar, row1, row2])
+        # --- Final Assembly (Ensuring everything is 780px wide) ---
+        panel_w = 780 # Standard width for 3 large thumbs or 5 small thumbs
+        
+        def pad_to_width(image, target_w):
+            if image.shape[1] < target_w:
+                p = np.zeros((image.shape[0], target_w - image.shape[1], 3), dtype=np.uint8)
+                return cv2.hconcat([image, p])
+            return image
+
+        row1 = pad_to_width(row1, panel_w)
+        row2 = pad_to_width(row2, panel_w)
+        row3 = pad_to_width(row3, panel_w)
+        
+        # Ensure bar matches the width
+        bar_resized = cv2.resize(bar, (panel_w, bar.shape[0]))
+
+        panel = cv2.vconcat([bar_resized, row1, row2, row3])
+        
         cv2.imshow("Navigation", panel)
         cv2.waitKey(1)
         print(f"Node {cur} -> Goal {self.goal_node} | "
               f"{hops} hops ({t_steps}s+{v_jumps}v) | >> {hint}")
-
-
-if __name__ == "__main__":
-    import argparse
-    import vis_nav_game
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--subsample", type=int, default=5,
-                        help="Take every Nth motion frame (default: 5)")
-    parser.add_argument("--n-clusters", type=int, default=128,
-                        help="VLAD codebook size (default: 128)")
-    parser.add_argument("--top-k", type=int, default=30,
-                        help="Number of global visual shortcut edges (default: 30)")
-    args = parser.parse_args()
-
-    vis_nav_game.play(the_player=KeyboardPlayerPyGame(
-        n_clusters=args.n_clusters,
-        subsample_rate=args.subsample,
-        top_k_shortcuts=args.top_k,
-    ))
