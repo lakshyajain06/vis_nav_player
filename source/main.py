@@ -13,15 +13,16 @@ parser.add_argument("--subsample", type=int, default=5,
                     help="Take every Nth motion frame (default: 5)")
 parser.add_argument("--n-clusters", type=int, default=128,
                     help="VLAD codebook size (default: 128)")
-parser.add_argument("--top-k", type=int, default=30,
+parser.add_argument("--top-k", type=int, default=60,
                     help="Number of global visual shortcut edges (default: 30)")
 args = parser.parse_args()
 
-extractor = "VLAD"
+extractor = "DINO"
 
-vis_nav_game.play(the_player=AutonomousPlayer(
+vis_nav_game.play(the_player=GraphPlayer(
     extractor=extractor,
-    n_clusters=args.n_clusters,
+    # n_clusters=args.n_clusters,
     subsample_rate=args.subsample,
     top_k_shortcuts=args.top_k,
+    patches=False
 ))

@@ -3,6 +3,7 @@ import cv2
 import os
 import numpy as np
 
+from torchvision.transforms import v2
 from transformers import AutoImageProcessor, Dinov2Model
 from PIL import Image
 from tqdm import tqdm
@@ -10,7 +11,7 @@ from tqdm import tqdm
 
 class DINOv2Extractor:
 
-    def __init__(self, file_list, img_dir="data/images/", cache_dir="cache", subsample_rate=5, device=None):
+    def __init__(self, file_list, img_dir="data/images/", cache_dir="cache", subsample_rate=5, patches=True, device=None,):
         if device:
             self.device = device
         else:
@@ -21,19 +22,30 @@ class DINOv2Extractor:
         self.file_list = file_list
         self.subsample_rate = subsample_rate
 
-        # create image preprocessor
-        print("Loading Image Preprocessor")
-        self.preprocessor = AutoImageProcessor.from_pretrained("facebook/dinov2-small")
+        self.patches=patches
 
-        # create dinov2 model
-        print("Loading DINOv2")
-        self.model = Dinov2Model.from_pretrained("facebook/dinov2-small").to(self.device)
+        self.transform = v2.Compose([
+              v2.Resize(350, interpolation=v2.InterpolationMode.BICUBIC),
+              v2.CenterCrop(350),
+              v2.ToTensor(),
+              v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),])
+        
+        self.model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+        
+        # create image preprocessor
+        # print("Loading Image Preprocessor")
+        # self.preprocessor = AutoImageProcessor.from_pretrained("facebook/dinov2-small")
+
+        # # create dinov2 model
+        # print("Loading DINOv2")
+        # self.model = Dinov2Model.from_pretrained("facebook/dinov2-small").to(self.device)
 
         self.model.eval() 
     
     @property
     def dim(self) -> int:
-        return self.model.config.hidden_size
+        return 384
+        # return self.model.config.hidden_size
 
     @torch.no_grad()
     def extract(self, img):
@@ -42,14 +54,19 @@ class DINOv2Extractor:
 
         pil_img = Image.fromarray(img_rgb)
 
-        inputs = self.preprocessor(images=pil_img, return_tensors="pt").to(self.device)
-        output = self.model(**inputs, output_hidden_states=True)
 
-        layer_features = output.hidden_states[9]
-        patch_tokens = layer_features[:, 1:, :]
-        p = 3.0
-        gem_pooled = (patch_tokens.clamp(min=1e-6).pow(p).mean(dim=1)).pow(1./p)
-        final_vector = torch.nn.functional.normalize(gem_pooled, p=2, dim=1)
+        inputs = self.transform(pil_img).unsqueeze(0).to(self.device)
+        features_dict = self.model.forward_features(inputs)
+        
+        if self.patches:
+            patch_tokens = features_dict['x_norm_patchtokens']
+            p = 3.0
+            gem_pooled = (patch_tokens.clamp(min=1e-6).pow(p).mean(dim=1)).pow(1./p)
+            final_vector = torch.nn.functional.normalize(gem_pooled, p=2, dim=1)
+        else:
+            final_vector = features_dict["x_norm_clstoken"]
+
+
         return final_vector.cpu().numpy().flatten()
     
         # cls_token = output.last_hidden_state[:, 0, :]
@@ -59,7 +76,7 @@ class DINOv2Extractor:
 
     @torch.no_grad()
     def extract_batch(self, batch_size=32):
-        cache_path = os.path.join(self.cache_dir, f"dino_ss{self.subsample_rate}.npy")
+        cache_path = os.path.join(self.cache_dir, f"dino_ss{self.subsample_rate}_patches{self.patches}.npy")
         if os.path.exists(cache_path):
             print(f"Loading cached Dino features from {cache_path}")
             features = np.load(cache_path)
@@ -72,16 +89,19 @@ class DINOv2Extractor:
             pil_images = []
 
             for im_file in batch_files:
-                pil_images.append(Image.open(os.path.join(self.img_dir, im_file)))
-                
-            inputs = self.preprocessor(images=pil_images, return_tensors="pt").to(self.device)
-            output = self.model(**inputs, output_hidden_states=True)
+                pil_images.append(self.transform(Image.open(os.path.join(self.img_dir, im_file))))
 
-            layer_features = output.hidden_states[9]
-            patch_tokens = layer_features[:, 1:, :]
-            p = 3.0
-            gem_pooled = (patch_tokens.clamp(min=1e-6).pow(p).mean(dim=1)).pow(1./p)
-            final_vector = torch.nn.functional.normalize(gem_pooled, p=2, dim=1)
+            inputs = torch.stack(pil_images).to(self.device)
+            features_dict = self.model.forward_features(inputs)
+            
+            if self.patches: 
+                patch_tokens = features_dict['x_norm_patchtokens']
+                p = 3.0
+                gem_pooled = (patch_tokens.clamp(min=1e-6).pow(p).mean(dim=1)).pow(1./p)
+                final_vector = torch.nn.functional.normalize(gem_pooled, p=2, dim=1)
+            else:
+                final_vector = features_dict["x_norm_clstoken"]
+
             np_features = final_vector.cpu().numpy()
 
             # cls_token = output.last_hidden_state[:, 0, :]
@@ -100,7 +120,12 @@ class DINOv2Extractor:
 
 
 if __name__ == "__main__":
-    extractor = DINOv2Extractor()
+    file_list = ["0.jpg"]
+    extractor = DINOv2Extractor(file_list=file_list)
+
+    img = cv2.imread("data/images/0.jpg")
+    extractor.extract(img)
+
     print("Ran successfully")
 
 

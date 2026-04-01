@@ -10,15 +10,15 @@ import networkx as nx
 from extractors.VladExtractor import VLADExtractor
 from extractors.DinoExtractor import DINOv2Extractor
 
-CACHE_DIR = "cache"
-IMAGE_DIR = "data/images/"
-DATA_INFO_PATH = "data/data_info.json"
+CACHE_DIR = "cache2"
+IMAGE_DIR = "data2/images/"
+DATA_INFO_PATH = "data2/data_info.json"
 
 # Graph construction
 TEMPORAL_WEIGHT = 1.0       # edge weight for consecutive frames
 VISUAL_WEIGHT_BASE = 2.0    # base weight for visual shortcut edges
 VISUAL_WEIGHT_SCALE = 3.0   # weight += scale * vlad_distance
-MIN_SHORTCUT_GAP = 50       # minimum trajectory index gap for shortcuts
+MIN_SHORTCUT_GAP = 25       # minimum trajectory index gap for shortcuts
 
 class GraphPlayer(Player):
 
@@ -62,7 +62,8 @@ class GraphPlayer(Player):
                 file_list=self.file_list, 
                 img_dir=IMAGE_DIR, 
                 cache_dir=CACHE_DIR, 
-                subsample_rate=self.subsample_rate
+                subsample_rate=self.subsample_rate,
+                **kwargs
             )
         else:
             raise TypeError("Not a valid extractor type")
